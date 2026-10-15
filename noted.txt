@@ -1,0 +1,5 @@
+ollama --version
+ollama list
+ollama ps
+
+node clipper.mjs "https://www.youtube.com/watch?v=KQK7hMCazFY" --lang id --clips 10 --nvenc

@@ -27,6 +27,8 @@ const { values: opt, positionals } = parseArgs({
     horizontal: { type: 'boolean', default: false }, // default: crop 9:16
     nvenc: { type: 'boolean', default: false }, // encode pakai GPU NVIDIA
     'no-subs': { type: 'boolean', default: false },
+    font: { type: 'string', default: 'Arial' }, // font subtitle (harus terinstall di Windows)
+    'sub-words': { type: 'string', default: '3' }, // maksimal kata per layar subtitle
     raw: { type: 'string', default: './video mentah' }, // video mentah + file kerja (audio, transkrip, srt)
     out: { type: 'string', default: './output' }, // klip hasil produksi
   },
@@ -42,6 +44,12 @@ const N_CLIPS = Number(opt.clips);
 const MIN_DUR = Number(opt.min);
 const MAX_DUR = Number(opt.max);
 const CHUNK_SEC = Number(opt.chunk);
+const SUB_WORDS = Math.max(1, Number(opt['sub-words']) || 3);
+
+// Ukuran subtitle mengikuti resolusi hasil: 1080x1920 (9:16) atau 1920x1080 (--horizontal)
+const SUB = opt.horizontal
+  ? { w: 1920, h: 1080, size: 58, outline: 4, marginV: 70, maxChars: 38 }
+  : { w: 1080, h: 1920, size: 80, outline: 6, marginV: 300, maxChars: 20 }; // marginV = jarak dari tepi bawah (px); makin kecil makin ke bawah
 
 // ---------- Helper ----------
 function run(cmd, args, options = {}) {
@@ -92,6 +100,38 @@ async function download(videoPath) {
   return videoPath;
 }
 
+// Gabungkan token whisper (potongan kata) menjadi kata utuh beserta waktu mulai/selesai
+function tokensToWords(tokens) {
+  const words = [];
+  for (const t of tokens ?? []) {
+    const raw = String(t.text ?? '');
+    const piece = raw.trim();
+    if (!piece || /^\[_.*\]$/.test(piece) || !t.offsets) continue; // lewati token spesial [_BEG_], [_TT_123]
+    const from = t.offsets.from / 1000;
+    const to = t.offsets.to / 1000;
+    if (/^\s/.test(raw) || !words.length) {
+      words.push({ start: from, end: to, text: piece });
+    } else {
+      const w = words.at(-1);
+      w.text += piece;
+      w.end = Math.max(w.end, to);
+    }
+  }
+  return words;
+}
+
+// Pastikan timestamp per kata masuk akal; kalau tidak, kembalikan null (nanti dipakai perkiraan)
+function validWords(words, seg) {
+  if (!words.length) return null;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (!(w.end >= w.start)) return null;
+    if (w.start < seg.start - 0.5 || w.end > seg.end + 0.5) return null;
+    if (i && w.start < words[i - 1].start - 0.05) return null;
+  }
+  return words;
+}
+
 // ---------- 2. Transkrip ----------
 async function transcribe(workDir, videoPath) {
   const jsonPath = path.join(workDir, 'transcript.json');
@@ -105,7 +145,7 @@ async function transcribe(workDir, videoPath) {
       '-f', wav,
       '-l', opt.lang,
       '-ml', '42', '-sow', // segmen pendek, pas untuk subtitle
-      '-oj',
+      '-ojf', // JSON lengkap: ada timestamp per token, dipakai untuk subtitle per kata
       '-of', path.join(workDir, 'transcript'),
     ]);
   } else {
@@ -113,7 +153,11 @@ async function transcribe(workDir, videoPath) {
   }
   const data = JSON.parse(await fs.readFile(jsonPath, 'utf8'));
   return data.transcription
-    .map((s) => ({ start: s.offsets.from / 1000, end: s.offsets.to / 1000, text: s.text.trim() }))
+    .map((s) => {
+      const seg = { start: s.offsets.from / 1000, end: s.offsets.to / 1000, text: s.text.trim() };
+      seg.words = validWords(tokensToWords(s.tokens), seg); // null kalau tidak ada timestamp per kata
+      return seg;
+    })
     .filter((s) => s.text && !/^\[.*\]$/.test(s.text)); // buang [MUSIC] dll
 }
 
@@ -237,6 +281,110 @@ async function buildSrt(segs, clip, file) {
   await fs.writeFile(file, lines.join('\n'), 'utf8');
 }
 
+// ---------- Subtitle gaya short-form (ASS) ----------
+// 2-3 kata per layar, besar dan tebal, kata yang sedang diucapkan disorot kuning
+const ASS_WHITE = '&H00FFFFFF'; // format warna ASS: BGR
+const ASS_BLACK = '&H00000000';
+const ASS_SHADOW = '&H80000000';
+
+const fmtAss = (sec) => {
+  const cs = Math.max(0, Math.round(sec * 100));
+  const h = Math.floor(cs / 360000);
+  const m = String(Math.floor((cs % 360000) / 6000)).padStart(2, '0');
+  const s = String(Math.floor((cs % 6000) / 100)).padStart(2, '0');
+  const c = String(cs % 100).padStart(2, '0');
+  return `${h}:${m}:${s}.${c}`;
+};
+
+function wordsOfSegment(seg) {
+  if (seg.words) return seg.words;
+  // Cadangan (transkrip lama tanpa timestamp per kata): bagi waktu menurut panjang kata
+  const parts = seg.text.split(/\s+/).filter(Boolean);
+  const total = parts.reduce((n, p) => n + p.length + 1, 0);
+  let t = seg.start;
+  return parts.map((p) => {
+    const d = ((p.length + 1) / total) * (seg.end - seg.start);
+    const w = { start: t, end: t + d, text: p };
+    t += d;
+    return w;
+  });
+}
+
+function groupWords(words, maxWords, maxChars) {
+  const groups = [];
+  let cur = [];
+  const chars = (g) => g.reduce((n, w) => n + w.text.length, 0) + Math.max(0, g.length - 1);
+  words.forEach((w, i) => {
+    if (cur.length && (cur.length >= maxWords || chars(cur) + 1 + w.text.length > maxChars)) {
+      groups.push(cur);
+      cur = [];
+    }
+    cur.push(w);
+    const next = words[i + 1];
+    // pisah grup di akhir kalimat atau saat ada jeda bicara
+    if (/[.?!…]$/.test(w.raw) || (next && next.start - w.end > 0.5)) {
+      groups.push(cur);
+      cur = [];
+    }
+  });
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+
+async function buildAss(segs, clip, file) {
+  const dur = clip.end - clip.start;
+  const clamp = (t) => Math.min(Math.max(t, 0), dur);
+
+  const words = [];
+  for (const s of segs) {
+    if (s.end <= clip.start || s.start >= clip.end) continue;
+    for (const w of wordsOfSegment(s)) {
+      if (w.start < clip.start - 0.05 || w.start >= clip.end) continue;
+      const raw = w.text.replace(/[{}\\]/g, '');
+      const text = raw.replace(/[.,;:…]+$/, ''); // tanda baca di akhir kata dibuang, ? dan ! tetap
+      if (!text) continue;
+      const prev = words.at(-1);
+      const start = Math.max(clamp(w.start - clip.start), prev ? prev.start : 0);
+      words.push({ start, end: Math.max(clamp(w.end - clip.start), start), raw, text });
+    }
+  }
+
+  const lines = [];
+  const groups = groupWords(words, SUB_WORDS, SUB.maxChars);
+  groups.forEach((g, gi) => {
+    const nextGroupStart = groups[gi + 1]?.[0].start ?? dur;
+    g.forEach((w, wi) => {
+      const next = g[wi + 1];
+      const rawEnd = next
+        ? next.start
+        : Math.min(Math.max(w.end, w.start + 0.15) + 0.25, nextGroupStart);
+      const end = Math.min(Math.max(rawEnd, w.start + 0.06), dur);
+      if (end <= w.start) return;
+      const text = g
+        .map((x, xi) => (xi === wi ? `{\\c&H00FFFF&}${x.text}{\\c&HFFFFFF&}` : x.text))
+        .join(' ');
+      lines.push(`Dialogue: 0,${fmtAss(w.start)},${fmtAss(end)},Default,,0,0,0,,${text}`);
+    });
+  });
+
+  const header = [
+    '[Script Info]',
+    'ScriptType: v4.00+',
+    `PlayResX: ${SUB.w}`,
+    `PlayResY: ${SUB.h}`,
+    'WrapStyle: 0',
+    'ScaledBorderAndShadow: yes',
+    '',
+    '[V4+ Styles]',
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+    `Style: Default,${opt.font},${SUB.size},${ASS_WHITE},${ASS_WHITE},${ASS_BLACK},${ASS_SHADOW},-1,0,0,0,100,100,0,0,1,${SUB.outline},2,2,60,60,${SUB.marginV},1`,
+    '',
+    '[Events]',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+  ];
+  await fs.writeFile(file, [...header, ...lines, ''].join('\n'), 'utf8');
+}
+
 async function cutClips(workDir, outDir, videoName, segs, clips) {
   await fs.mkdir(outDir, { recursive: true });
   for (let i = 0; i < clips.length; i++) {
@@ -244,16 +392,16 @@ async function cutClips(workDir, outDir, videoName, segs, clips) {
     const base = `clip_${String(i + 1).padStart(2, '0')}_${safeName(c.title)}`;
     const srtName = `${base}.srt`;
     await buildSrt(segs, c, path.join(workDir, srtName));
+    const assName = `${base}.ass`;
+    await buildAss(segs, c, path.join(workDir, assName));
 
     const filters = [];
     if (!opt.horizontal) {
       filters.push("crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'", 'scale=1080:1920');
     }
     if (!opt['no-subs']) {
-      // ffmpeg dijalankan dengan cwd=workDir supaya path .srt relatif (hindari masalah escape di Windows)
-      filters.push(
-        `subtitles=${srtName}:force_style='FontName=Arial,FontSize=11,Bold=1,Outline=2,Shadow=0,Alignment=2,MarginV=20'`
-      );
+      // ffmpeg dijalankan dengan cwd=workDir supaya path .ass relatif (hindari masalah escape di Windows)
+      filters.push(`ass=${assName}`);
     }
 
     const outFile = path.resolve(outDir, `${base}.mp4`);
