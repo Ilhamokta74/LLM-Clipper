@@ -2,4 +2,7 @@ ollama --version
 ollama list
 ollama ps
 
-node clipper.mjs "https://www.youtube.com/watch?v=KQK7hMCazFY" --lang id --clips 10 --nvenc
+node clipper.mjs "https://www.youtube.com/watch?v=KQK7hMCazFY&t" --lang id --clips 10 --nvenc
+node clipper.mjs "https://www.youtube.com/watch?v=3pI7Lm0Q_eA&t" --lang id --clips 10 --nvenc
+node clipper.mjs "https://www.youtube.com/watch?v=h_EAT2tX1es" --lang id --clips 10 --nvenc
+node clipper.mjs "https://www.youtube.com/watch?v=D-xShRWhiY4" --lang id --clips 10 --nvenc
