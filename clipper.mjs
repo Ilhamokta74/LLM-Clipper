@@ -27,7 +27,8 @@ const { values: opt, positionals } = parseArgs({
     horizontal: { type: 'boolean', default: false }, // default: crop 9:16
     nvenc: { type: 'boolean', default: false }, // encode pakai GPU NVIDIA
     'no-subs': { type: 'boolean', default: false },
-    out: { type: 'string', default: './output' },
+    raw: { type: 'string', default: './video mentah' }, // video mentah + file kerja (audio, transkrip, srt)
+    out: { type: 'string', default: './output' }, // klip hasil produksi
   },
 });
 
@@ -65,9 +66,17 @@ const fmtSrt = (sec) => {
 const safeName = (s) =>
   s.replace(/[^\p{L}\p{N}\s-]/gu, '').trim().replace(/\s+/g, '_').slice(0, 60) || 'clip';
 
+// Nama folder dari judul video: spasi dipertahankan, karakter terlarang Windows dibuang
+const folderName = (s) =>
+  s
+    .replace(/[\\/:*?"<>|%\u0000-\u001f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+    .replace(/[. ]+$/, '') || 'video';
+
 // ---------- 1. Download ----------
-async function download(workDir) {
-  const videoPath = path.join(workDir, 'video.mp4');
+async function download(videoPath) {
   if (existsSync(videoPath)) {
     console.log('• Video sudah ada, lewati download.');
     return videoPath;
@@ -77,7 +86,7 @@ async function download(workDir) {
     '--no-playlist',
     '-f', 'bv*[height<=1080]+ba/b',
     '--merge-output-format', 'mp4',
-    '-o', path.join(workDir, 'video.%(ext)s'),
+    '-o', videoPath.replace(/\.mp4$/, '') + '.%(ext)s',
     url,
   ]);
   return videoPath;
@@ -228,7 +237,7 @@ async function buildSrt(segs, clip, file) {
   await fs.writeFile(file, lines.join('\n'), 'utf8');
 }
 
-async function cutClips(workDir, outDir, segs, clips) {
+async function cutClips(workDir, outDir, videoName, segs, clips) {
   await fs.mkdir(outDir, { recursive: true });
   for (let i = 0; i < clips.length; i++) {
     const c = clips[i];
@@ -258,7 +267,7 @@ async function cutClips(workDir, outDir, segs, clips) {
       [
         '-y', '-loglevel', 'error', '-stats',
         '-ss', c.start.toFixed(2),
-        '-i', 'video.mp4',
+        '-i', videoName,
         '-t', (c.end - c.start).toFixed(2),
         ...(filters.length ? ['-vf', filters.join(',')] : []),
         ...venc,
@@ -273,16 +282,31 @@ async function cutClips(workDir, outDir, segs, clips) {
 
 // ---------- Main ----------
 async function main() {
-  const { stdout } = await execFileP('yt-dlp', ['--no-playlist', '--print', 'id', url]).catch((e) => {
+  const { stdout } = await execFileP('yt-dlp', [
+    '--no-playlist', '--encoding', 'utf-8', '--print', 'id', '--print', 'title', url,
+  ]).catch((e) => {
     throw new Error(`yt-dlp gagal: ${e.message}`);
   });
-  const id = stdout.trim().split('\n')[0];
-  const workDir = path.resolve(opt.out, id, 'work');
-  const outDir = path.resolve(opt.out, id);
-  await fs.mkdir(workDir, { recursive: true });
+  const [id, ...titleParts] = stdout.trim().split(/\r?\n/);
+  let name = folderName(titleParts.join(' ') || id);
 
-  const videoPath = await download(workDir);
-  const segs = await transcribe(workDir, videoPath);
+  // Judul sama tapi video beda: tambahkan id supaya file kerja tidak tercampur
+  try {
+    const prev = await fs.readFile(path.resolve(opt.raw, name, 'sumber.txt'), 'utf8');
+    if (prev.split(/\r?\n/)[0].trim() !== id) name = `${name} [${id}]`;
+  } catch { /* folder baru */ }
+
+  const rawDir = path.resolve(opt.raw, name); // video mentah + audio, transkrip, srt
+  const outDir = path.resolve(opt.out, name); // klip hasil produksi
+  await fs.mkdir(rawDir, { recursive: true });
+  await fs.writeFile(path.join(rawDir, 'sumber.txt'), `${id}\n${url}\n`, 'utf8');
+  console.log(`• Judul   : ${name}`);
+  console.log(`• Mentah  : ${rawDir}`);
+  console.log(`• Hasil   : ${outDir}`);
+
+  const videoName = `${name}.mp4`;
+  const videoPath = await download(path.join(rawDir, videoName));
+  const segs = await transcribe(rawDir, videoPath);
   console.log(`• Transkrip: ${segs.length} segmen`);
 
   const clips = await pickClips(segs);
@@ -290,8 +314,9 @@ async function main() {
     console.log('Tidak ada klip yang lolos. Coba model lain, turunkan --min, atau cek bahasa (--lang).');
     return;
   }
+  await fs.mkdir(outDir, { recursive: true });
   await fs.writeFile(path.join(outDir, 'clips.json'), JSON.stringify(clips, null, 2));
-  await cutClips(workDir, outDir, segs, clips);
+  await cutClips(rawDir, outDir, videoName, segs, clips);
   console.log(`\nSelesai. ${clips.length} klip ada di: ${outDir}`);
 }
 

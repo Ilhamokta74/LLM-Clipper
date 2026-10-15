@@ -66,7 +66,26 @@ node clipper.mjs "URL" --lang id --clips 8 --min 30 --max 60 --nvenc
 node clipper.mjs "URL" --lang en --horizontal --no-subs
 ```
 
-Hasil ada di `output/<id-video>/` beserta `clips.json` (judul, alasan, skor). File mentah (video, audio, transkrip) disimpan di `output/<id-video>/work/`, jadi menjalankan ulang tidak mengulang download dan transkrip.
+## Struktur folder
+
+Folder dibuat otomatis di tempat kamu menjalankan perintah, memakai **judul video YouTube** sebagai nama foldernya:
+
+```
+video mentah/
+  <judul video>/
+    <judul video>.mp4     <- video asli hasil download
+    audio.wav, transcript.json, clip_XX_....srt   <- file kerja
+    sumber.txt            <- id dan URL video
+output/
+  <judul video>/
+    clip_01_....mp4 ... clip_05_....mp4           <- klip hasil produksi
+    clips.json            <- judul, alasan, skor tiap klip
+```
+
+- Karakter yang tidak boleh dipakai di nama folder Windows (`\ / : * ? " < > |`) dan `%` dibuang dari judul. Nama folder dipotong maksimal 80 karakter.
+- Kalau ada dua video berbeda dengan judul yang sama, folder kedua diberi tambahan ` [id-video]` supaya file tidak tercampur.
+- Menjalankan ulang video yang sama tidak mengulang download dan transkrip.
+- Nomor klip berdasarkan urutan waktu di video, bukan peringkat skor.
 
 ## Opsi
 
@@ -83,7 +102,8 @@ Hasil ada di `output/<id-video>/` beserta `clips.json` (judul, alasan, skor). Fi
 | `--whisper-bin` | Path `whisper-cli` (hanya kalau tidak ada di PATH) | `whisper-cli` |
 | `--whisper-model` | Path model whisper (menimpa `WHISPER_MODEL`) | `./models/ggml-large-v3-turbo-q5_0.bin` |
 | `--ollama` | URL server Ollama | `http://localhost:11434` |
-| `--out` | Folder output | `./output` |
+| `--raw` | Folder video mentah dan file kerja | `./video mentah` |
+| `--out` | Folder klip hasil produksi | `./output` |
 
 Variabel lingkungan yang dibaca script: `WHISPER_BIN`, `WHISPER_MODEL`, `OLLAMA_MODEL`, `OLLAMA_URL`.
 
