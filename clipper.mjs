@@ -8,6 +8,7 @@ import { parseArgs } from 'node:util';
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const execFileP = promisify(execFile);
 
@@ -17,14 +18,16 @@ const { values: opt, positionals } = parseArgs({
   options: {
     model: { type: 'string', default: process.env.OLLAMA_MODEL || 'qwen2.5:7b' },
     lang: { type: 'string', default: 'id' },
-    clips: { type: 'string', default: '5' },
-    min: { type: 'string', default: '30' },
-    max: { type: 'string', default: '60' },
+    ctx: { type: 'string', default: '16384' }, // num_ctx Ollama (potongan transkrip panjang butuh konteks besar)
     'whisper-bin': { type: 'string', default: process.env.WHISPER_BIN || 'whisper-cli' },
     'whisper-model': { type: 'string', default: process.env.WHISPER_MODEL || './models/ggml-large-v3-turbo-q5_0.bin' },
     ollama: { type: 'string', default: process.env.OLLAMA_URL || 'http://localhost:11434' },
-    chunk: { type: 'string', default: '360' }, // detik per potongan transkrip untuk LLM
+    chunk: { type: 'string', default: '900' }, // detik per potongan transkrip untuk LLM (antar potongan dibuat bertumpuk)
     horizontal: { type: 'boolean', default: false }, // default: crop 9:16
+    // layout 9:16: crop = potong tengah | fit = video utuh + background blur | follow = ikuti pembicara (butuh Python + mediapipe)
+    layout: { type: 'string', default: 'crop' },
+    python: { type: 'string', default: process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3') },
+    'track-model': { type: 'string', default: process.env.FACE_MODEL || '' }, // path face_landmarker.task (kosong = ./models di sebelah facetrack.py)
     nvenc: { type: 'boolean', default: false }, // encode pakai GPU NVIDIA
     'no-subs': { type: 'boolean', default: false },
     font: { type: 'string', default: 'Arial' }, // font subtitle (harus terinstall di Windows)
@@ -36,14 +39,24 @@ const { values: opt, positionals } = parseArgs({
 
 const url = positionals[0];
 if (!url) {
-  console.error('Pemakaian: node clipper.mjs <url-youtube> [--lang id] [--clips 5] [--min 30] [--max 60] [--model qwen2.5:7b] [--nvenc] [--horizontal] [--no-subs]');
+  console.error('Pemakaian: node clipper.mjs <url-youtube> [--lang id] [--model qwen2.5:7b] [--layout crop|fit|follow] [--nvenc] [--horizontal] [--no-subs]');
   process.exit(1);
 }
 
-const N_CLIPS = Number(opt.clips);
-const MIN_DUR = Number(opt.min);
-const MAX_DUR = Number(opt.max);
+if (!['crop', 'fit', 'follow'].includes(opt.layout)) {
+  console.error(`--layout harus crop, fit, atau follow (bukan "${opt.layout}")`);
+  process.exit(1);
+}
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+// Dikunci: semua klip yang skor akhirnya >= MIN_SCORE diproduksi (tanpa batas jumlah), durasi 30-200 detik
+const MIN_SCORE = 8;
+const MIN_DUR = 30;
+const MAX_DUR = 200;
+const NUM_CTX = Number(opt.ctx) || 16384;
 const CHUNK_SEC = Number(opt.chunk);
+// Potongan transkrip saling menumpuk supaya klip panjang yang melewati batas potongan tetap utuh di salah satunya
+const OVERLAP_SEC = Math.min(Math.max(120, MAX_DUR + 30), Math.floor(CHUNK_SEC / 2));
 const SUB_WORDS = Math.max(1, Number(opt['sub-words']) || 3);
 
 // Ukuran subtitle mengikuti resolusi hasil: 1080x1920 (9:16) atau 1920x1080 (--horizontal)
@@ -162,17 +175,19 @@ async function transcribe(workDir, videoPath) {
 }
 
 // ---------- 3. Pilih momen dengan LLM ----------
+// Tahap 1: LLM mengusulkan kandidat per potongan transkrip (potongan saling bertumpuk, jumlah dan durasi bebas).
+// Tahap 2: tiap kandidat dinilai ulang dengan rubrik terpisah (hook, utuh, nilai, emosi).
+// Tahap 3: produksi semua kandidat yang skor akhirnya >= MIN_SCORE (jumlah tidak dibatasi).
 function chunkSegments(segs) {
+  if (!segs.length) return [];
+  const end = segs.at(-1).end;
+  const stride = Math.max(60, CHUNK_SEC - OVERLAP_SEC);
   const chunks = [];
-  let cur = [];
-  for (const s of segs) {
-    if (cur.length && s.start - cur[0].start >= CHUNK_SEC) {
-      chunks.push(cur);
-      cur = [];
-    }
-    cur.push(s);
+  for (let w = segs[0].start; w < end; w += stride) {
+    const part = segs.filter((s) => s.start >= w && s.start < w + CHUNK_SEC);
+    if (part.length) chunks.push(part);
+    if (w + CHUNK_SEC >= end) break;
   }
-  if (cur.length) chunks.push(cur);
   return chunks;
 }
 
@@ -188,28 +203,7 @@ function extractJson(text) {
   return null;
 }
 
-async function askLlm(chunk) {
-  const transcript = chunk.map((s) => `[${Math.round(s.start)}] ${s.text}`).join('\n');
-  const prompt = `Kamu editor video short-form (TikTok/Reels/Shorts). Di bawah ini transkrip sebagian video.
-Setiap baris diawali detik awal dalam kurung siku, misalnya [125].
-
-Pilih sampai 3 bagian terbaik untuk dijadikan klip pendek.
-Aturan:
-- Durasi tiap klip antara ${MIN_DUR} dan ${MAX_DUR} detik (end - start).
-- Kalimat pertama harus menarik perhatian (hook): pertanyaan, klaim berani, cerita, atau fakta mengejutkan.
-- Ide harus utuh dan jelas, jangan mulai atau berhenti di tengah kalimat.
-- Jangan tumpang tindih antar klip.
-- Kalau tidak ada bagian yang layak, kembalikan daftar kosong.
-- "start" dan "end" dalam detik (angka), memakai angka dari transkrip.
-- "title" singkat dan menarik, dalam bahasa yang sama dengan transkrip.
-- "score" 1-10 untuk potensi viral.
-
-Balas HANYA JSON dengan format:
-{"clips":[{"start":0,"end":0,"title":"","reason":"","score":0}]}
-
-TRANSKRIP:
-${transcript}`;
-
+async function llmJson(prompt) {
   const res = await fetch(`${opt.ollama}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -217,13 +211,36 @@ ${transcript}`;
       model: opt.model,
       stream: false,
       format: 'json',
-      options: { temperature: 0.3, num_ctx: 8192 },
+      options: { temperature: 0.2, num_ctx: NUM_CTX },
       messages: [{ role: 'user', content: prompt }],
     }),
   });
   if (!res.ok) throw new Error(`Ollama error ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  const parsed = extractJson(data.message?.content ?? '');
+  return extractJson(data.message?.content ?? '');
+}
+
+async function askLlm(chunk) {
+  const transcript = chunk.map((s) => `[${Math.round(s.start)}] ${s.text}`).join('\n');
+  const prompt = `Kamu editor video short-form (TikTok/Reels/Shorts) yang sangat selektif. Di bawah ini transkrip sebagian video.
+Setiap baris diawali detik awal dalam kurung siku, misalnya [125].
+
+Pilih HANYA bagian yang benar-benar layak berdiri sendiri sebagai klip. Boleh nol, boleh satu, boleh beberapa. Jangan memaksakan jumlah; bagian yang biasa saja jangan dipilih.
+Aturan:
+- Durasi mengikuti isi: satu ide atau cerita utuh dari awal sampai punchline/kesimpulan. Minimal ${MIN_DUR} detik, maksimal ${MAX_DUR} detik. Jangan dipotong paksa dan jangan diulur-ulur.
+- Kalimat pertama harus menarik perhatian (hook): pertanyaan, klaim berani, cerita, atau fakta mengejutkan.
+- Jangan mulai atau berhenti di tengah kalimat. Jangan tumpang tindih antar klip.
+- "start" dan "end" dalam detik (angka), memakai angka dari transkrip.
+- "title" singkat dan menarik, dalam bahasa yang sama dengan transkrip.
+- "score" 1-10 untuk potensi viral; beri 8 ke atas hanya untuk yang luar biasa.
+
+Balas HANYA JSON dengan format:
+{"clips":[{"start":0,"end":0,"title":"","reason":"","score":0}]}
+Kalau tidak ada yang layak: {"clips":[]}
+
+TRANSKRIP:
+${transcript}`;
+  const parsed = await llmJson(prompt);
   return Array.isArray(parsed?.clips) ? parsed.clips : [];
 }
 
@@ -233,9 +250,49 @@ function snapToSegments(segs, start, end) {
   return { start: a.start, end: b.end };
 }
 
-async function pickClips(segs) {
+const textBetween = (segs, start, end) =>
+  segs.filter((s) => s.end > start && s.start < end).map((s) => s.text).join(' ');
+
+// Penilaian ulang per kandidat dengan rubrik; mengembalikan skor 1-10 atau null kalau LLM gagal
+async function rateClip(segs, c) {
+  const text = textBetween(segs, c.start, c.end).slice(0, 8000);
+  const prompt = `Kamu penilai konten short-form yang ketat. Nilai transkrip klip berikut (durasi ${Math.round(c.end - c.start)} detik).
+Beri nilai bulat 1-10 untuk tiap kriteria. Nilai 7 ke atas hanya untuk yang benar-benar bagus; klip yang biasa saja = 4-5.
+- hook: apakah beberapa detik pertama langsung menarik perhatian orang yang belum tahu konteks
+- utuh: apakah ide/ceritanya lengkap, bisa dipahami berdiri sendiri, dan berakhir rapi
+- nilai: apakah isinya berharga (insight, fakta, cerita, humor, atau opini kuat)
+- emosi: apakah memicu penasaran, tawa, kaget, atau keinginan untuk membagikan
+
+Balas HANYA JSON: {"hook":0,"utuh":0,"nilai":0,"emosi":0}
+
+TRANSKRIP:
+${text}`;
+  const j = await llmJson(prompt);
+  if (!j) return null;
+  const n = (k) => Math.min(10, Math.max(1, Number(j[k]) || 1));
+  return 0.3 * n('hook') + 0.3 * n('utuh') + 0.25 * n('nilai') + 0.15 * n('emosi');
+}
+
+const clock = (sec) => {
+  const s = Math.round(sec);
+  const h = Math.floor(s / 3600);
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const r = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${m}:${r}` : `${m}:${r}`;
+};
+
+function dropOverlaps(sorted) {
+  const kept = [];
+  for (const c of sorted) {
+    if (kept.some((x) => c.start < x.end && c.end > x.start)) continue;
+    kept.push(c);
+  }
+  return kept;
+}
+
+async function pickClips(segs, workDir) {
   const chunks = chunkSegments(segs);
-  let candidates = [];
+  const cand = [];
   for (let i = 0; i < chunks.length; i++) {
     console.log(`• LLM menganalisis bagian ${i + 1}/${chunks.length}...`);
     try {
@@ -246,7 +303,7 @@ async function pickClips(segs) {
         const snapped = snapToSegments(segs, s, e);
         const dur = snapped.end - snapped.start;
         if (dur < MIN_DUR - 5 || dur > MAX_DUR + 15) continue;
-        candidates.push({
+        cand.push({
           ...snapped,
           title: String(c.title || 'Klip'),
           reason: String(c.reason || ''),
@@ -257,14 +314,29 @@ async function pickClips(segs) {
       console.warn(`  ! Gagal di bagian ${i + 1}: ${err.message}`);
     }
   }
-  // Urutkan dari skor tertinggi, buang yang tumpang tindih
-  candidates.sort((a, b) => b.score - a.score);
-  const chosen = [];
-  for (const c of candidates) {
-    if (chosen.some((x) => c.start < x.end && c.end > x.start)) continue;
-    chosen.push(c);
-    if (chosen.length >= N_CLIPS) break;
+
+  // Potongan bertumpuk bisa menemukan momen yang sama dua kali: sisakan yang skor tahap 1-nya tertinggi
+  const pool = dropOverlaps(cand.sort((a, b) => b.score - a.score));
+  console.log(`• ${pool.length} kandidat, dinilai ulang satu per satu...`);
+  for (let i = 0; i < pool.length; i++) {
+    const c = pool[i];
+    try {
+      c.rubric = await rateClip(segs, c);
+    } catch (err) {
+      console.warn(`  ! Gagal menilai kandidat ${i + 1}: ${err.message}`);
+      c.rubric = null;
+    }
+    // 70% penilaian rubrik, 30% skor usulan; kalau rubrik gagal pakai skor usulan saja
+    c.final = Math.round((c.rubric == null ? c.score : 0.7 * c.rubric + 0.3 * c.score) * 10) / 10;
   }
+  pool.sort((a, b) => b.final - a.final);
+
+  const chosen = pool.filter((c) => c.final >= MIN_SCORE);
+  const ids = new Set(chosen);
+  for (const c of pool) {
+    console.log(`  ${ids.has(c) ? '✔' : '✘'} ${c.final.toFixed(1).padStart(4)}  ${clock(c.start)}-${clock(c.end)} (${Math.round(c.end - c.start)} dtk)  ${c.title}`);
+  }
+  await fs.writeFile(path.join(workDir, 'kandidat.json'), JSON.stringify(pool, null, 2), 'utf8');
   return chosen.sort((a, b) => a.start - b.start);
 }
 
@@ -385,6 +457,34 @@ async function buildAss(segs, clip, file) {
   await fs.writeFile(file, [...header, ...lines, ''].join('\n'), 'utf8');
 }
 
+// ---------- Layout follow: crop mengikuti pembicara (facetrack.py) ----------
+async function trackClip(workDir, videoName, c, trackFile) {
+  const args = [
+    path.join(SCRIPT_DIR, 'facetrack.py'), videoName,
+    '--start', c.start.toFixed(2),
+    '--dur', (c.end - c.start).toFixed(2),
+    '--out', trackFile,
+  ];
+  if (opt['track-model']) args.push('--model', path.resolve(opt['track-model']));
+  await run(opt.python, args, { cwd: workDir });
+  return JSON.parse(await fs.readFile(path.join(workDir, trackFile), 'utf8'));
+}
+
+// Segmen [t0, t1, x0, x1] (detik, piksel) -> ekspresi x untuk filter crop ffmpeg (bentuk penjumlahan, tanpa nested if)
+function followCropFilter(tr) {
+  const f = (n) => Number(n).toFixed(3);
+  const terms = tr.segments.map(([t0, t1, x0, x1], i) => {
+    const last = i === tr.segments.length - 1;
+    const cond = [`gte(t,${f(t0)})`, ...(last ? [] : [`lt(t,${f(t1)})`])].join('*');
+    const val =
+      Math.abs(x1 - x0) < 0.5 || t1 <= t0
+        ? f(x0)
+        : `(${f(x0)}+(${f(x1 - x0)})*(t-${f(t0)})/${f(t1 - t0)})`;
+    return `${cond}*${val}`;
+  });
+  return `crop=${tr.cw}:ih:x='${terms.join('+')}':y=0`;
+}
+
 async function cutClips(workDir, outDir, videoName, segs, clips) {
   await fs.mkdir(outDir, { recursive: true });
   for (let i = 0; i < clips.length; i++) {
@@ -395,13 +495,33 @@ async function cutClips(workDir, outDir, videoName, segs, clips) {
     const assName = `${base}.ass`;
     await buildAss(segs, c, path.join(workDir, assName));
 
-    const filters = [];
-    if (!opt.horizontal) {
-      filters.push("crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'", 'scale=1080:1920');
+    const subFilter = opt['no-subs'] ? null : `ass=${assName}`; // cwd=workDir supaya path .ass relatif (hindari masalah escape di Windows)
+    const centerCrop = ["crop='min(iw,ih*9/16)':'min(ih,iw*16/9)'", 'scale=1080:1920'];
+
+    let layout = opt.horizontal ? 'horizontal' : opt.layout;
+    let filters = []; // dipakai dengan -vf
+    let complex = null; // dipakai dengan -filter_complex (layout fit)
+
+    if (layout === 'follow') {
+      try {
+        console.log(`• Analisis wajah/pembicara klip ${i + 1}/${clips.length}...`);
+        const tr = await trackClip(workDir, videoName, c, `${base}.track.json`);
+        console.log(`  shot: ${tr.cuts.length + 1}, segmen crop: ${tr.segments.length}`);
+        filters = [followCropFilter(tr), 'scale=1080:1920'];
+      } catch (err) {
+        console.warn(`  ! Analisis pembicara gagal (${err.message}). Pakai crop tengah untuk klip ini.`);
+        layout = 'crop';
+      }
     }
-    if (!opt['no-subs']) {
-      // ffmpeg dijalankan dengan cwd=workDir supaya path .ass relatif (hindari masalah escape di Windows)
-      filters.push(`ass=${assName}`);
+    if (layout === 'crop') filters = [...centerCrop];
+    if (layout === 'fit') {
+      complex =
+        '[0:v]split=2[bg][fg];' +
+        '[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:6[b];' +
+        '[fg]scale=1080:-2[f];' +
+        `[b][f]overlay=(W-w)/2:(H-h)/2${subFilter ? '[v0];[v0]' + subFilter : ''}[v]`;
+    } else if (subFilter) {
+      filters.push(subFilter);
     }
 
     const outFile = path.resolve(outDir, `${base}.mp4`);
@@ -417,7 +537,7 @@ async function cutClips(workDir, outDir, videoName, segs, clips) {
         '-ss', c.start.toFixed(2),
         '-i', videoName,
         '-t', (c.end - c.start).toFixed(2),
-        ...(filters.length ? ['-vf', filters.join(',')] : []),
+        ...(complex ? ['-filter_complex', complex, '-map', '[v]', '-map', '0:a?'] : filters.length ? ['-vf', filters.join(',')] : []),
         ...venc,
         '-c:a', 'aac', '-b:a', '160k',
         '-movflags', '+faststart',
@@ -457,9 +577,9 @@ async function main() {
   const segs = await transcribe(rawDir, videoPath);
   console.log(`• Transkrip: ${segs.length} segmen`);
 
-  const clips = await pickClips(segs);
+  const clips = await pickClips(segs, rawDir);
   if (!clips.length) {
-    console.log('Tidak ada klip yang lolos. Coba model lain, turunkan --min, atau cek bahasa (--lang).');
+    console.log('Tidak ada klip yang lolos. Lihat kandidat.json di folder mentah untuk skor tiap kandidat, coba model lain, atau cek bahasa (--lang).');
     return;
   }
   await fs.mkdir(outDir, { recursive: true });
