@@ -19,6 +19,7 @@ Pemakaian:
 import argparse
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from bisect import bisect_left, bisect_right
@@ -46,6 +47,11 @@ DEFAULTS = dict(
     drift_dur=0.5,        # detik durasi geser halus saat orangnya sendiri bergerak
     present_win=1.5,      # detik: wajah dianggap masih ada setelah terakhir terlihat
     min_track_frac=0.15,  # track yang terlihat < segini dari sampel shot dianggap wajah palsu (poster dsb)
+    use_audio=1.0,        # 1 = pakai audio (gerbang suara + sinkron bibir-audio), 0 = visual saja
+    audio_gate=0.25,      # bobot gerak mulut saat audio diam (0 = abaikan total, 1 = audio tidak berpengaruh)
+    corr_w=1.0,           # kekuatan bonus/penalti korelasi bukaan mulut vs keras suara (0 = matikan)
+    corr_win=1.5,         # detik: jendela (terpusat) untuk menghitung korelasi
+    audio_cap=0.6,        # saat audio ada: batas atas skor gerak mulut (gerak besar tapi tidak sinkron tidak boleh menang)
 )
 
 
@@ -109,6 +115,59 @@ class FaceDetector:
                 jaw = 5.0 * abs(pts[14].y - pts[13].y) / face_h
             faces.append({"cx": (min(xs) + max(xs)) / 2, "w": max(xs) - min(xs), "m": jaw})
         return faces
+
+
+# ---------------------------------------------------------------- audio
+def load_audio_db(video, start, dur, ffmpeg="ffmpeg", sr=16000):
+    """Keras suara (dB) tiap 10 ms, dibatasi ke pita suara manusia. None kalau ffmpeg gagal / tidak ada audio."""
+    cmd = [ffmpeg, "-v", "error", "-ss", f"{max(start, 0.0):.3f}", "-t", f"{dur:.3f}", "-i", video,
+           "-vn", "-ac", "1", "-ar", str(sr), "-af", "highpass=f=150,lowpass=f=3800", "-f", "f32le", "-"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=600).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    x = np.frombuffer(raw, dtype=np.float32)
+    hop = sr // 100
+    n = x.size // hop
+    if n < 50:
+        return None
+    rms = np.sqrt(np.mean(x[: n * hop].reshape(n, hop) ** 2, axis=1)) + 1e-8
+    return 20.0 * np.log10(rms)
+
+
+def attach_audio(samples, db, fps):
+    """Isi s['a'] (keras suara 0-1) dan s['v'] (ada suara 0-1) di tiap sampel. Return False kalau audio tidak berguna."""
+    if db is None or not samples:
+        return False
+    floor, peak = float(np.percentile(db, 10)), float(np.percentile(db, 95))
+    if peak - floor < 6.0:  # audio datar / senyap: tidak ada informasi
+        return False
+    h = 0.5 / fps
+    for s in samples:
+        lo = max(int((s["t"] - h) * 100), 0)
+        hi = min(max(int((s["t"] + h) * 100) + 1, lo + 1), len(db))
+        seg = db[lo:hi] if lo < len(db) else db[-1:]
+        a = float(np.clip((float(np.mean(seg)) - floor) / (peak - floor), 0.0, 1.0))
+        s["a"] = a
+        s["v"] = float(np.clip((a - 0.2) / 0.2, 0.0, 1.0))
+    return True
+
+
+def windowed_corr(x, y, half):
+    """Korelasi Pearson di jendela geser; x boleh berisi NaN (wajah tidak terlihat)."""
+    n = len(x)
+    out = np.zeros(n)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        xs, ys = x[lo:hi], y[lo:hi]
+        ok = ~np.isnan(xs)
+        if ok.sum() < 6:
+            continue
+        xs, ys = xs[ok], ys[ok]
+        if xs.std() < 1e-6 or ys.std() < 1e-6:
+            continue
+        out[i] = float(np.corrcoef(xs, ys)[0, 1])
+    return out
 
 
 # ---------------------------------------------------------------- analisis (murni, bisa diuji)
@@ -201,6 +260,27 @@ def pick_speakers(samples, tracks, cfg):
     pos = S[S > 0]
     ref = max(float(np.percentile(pos, 90)) if pos.size else 0.0, cfg["speak_floor"])
     E = np.clip(S / ref - cfg["speak_thr"], 0.0, 2.0)
+
+    if cfg.get("use_audio", 0) >= 0.5 and n and all("a" in s for s in samples):
+        A = np.array([s["a"] for s in samples])
+        V = np.array([s["v"] for s in samples])
+        # gerbang suara: gerak mulut saat tidak ada suara (senyum, tertawa tanpa suara, mengunyah) diredam
+        w = max(1, int(round(cfg["speak_win"] * cfg["sample_fps"])))
+        Vm = np.array([V[max(0, i - w // 2): i + w // 2 + 1].max() for i in range(n)])
+        E = np.minimum(E, cfg["audio_cap"])
+        E *= (cfg["audio_gate"] + (1.0 - cfg["audio_gate"]) * Vm)[:, None]
+        # sinkron bibir-audio: bukaan mulut yang naik-turun bersama keras suara = kemungkinan besar pembicara
+        if cfg["corr_w"] > 0:
+            idx = {round(s["t"], 6): i for i, s in enumerate(samples)}
+            half = max(3, int(round(cfg["corr_win"] * cfg["sample_fps"] / 2)))
+            for j, tr in enumerate(tracks):
+                m = np.full(n, np.nan)
+                for t_, m_ in zip(tr.t, tr.m):
+                    i = idx.get(round(t_, 6))
+                    if i is not None:
+                        m[i] = m_
+                C = windowed_corr(m, A, half)
+                E[:, j] *= np.clip(0.3 + 2.0 * cfg["corr_w"] * np.maximum(C, 0.0), 0.3, 2.0)
     E += 1e-3 * np.array([tr.mean_w() for tr in tracks])[None, :]  # seri -> condong ke wajah yang lebih besar
     E[~P] = -1.0  # wajah yang sedang tidak terlihat tidak layak dipilih
 
@@ -319,7 +399,7 @@ def to_pixels(segs, width, cw):
 
 
 # ---------------------------------------------------------------- baca video
-def process(video, start, dur, detector, cfg, det_width=1920, debug=False):
+def process(video, start, dur, detector, cfg, det_width=1920, debug=False, ffmpeg="ffmpeg"):
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
         raise RuntimeError(f"Tidak bisa membuka video: {video}")
@@ -378,6 +458,12 @@ def process(video, start, dur, detector, cfg, det_width=1920, debug=False):
             next_sample = t + 1.0 / cfg["sample_fps"]
     cap.release()
 
+    audio_ok = False
+    if cfg.get("use_audio", 0) >= 0.5:
+        audio_ok = attach_audio(samples, load_audio_db(video, start, dur, ffmpeg), cfg["sample_fps"])
+        if not audio_ok:
+            print("  ! Audio tidak terbaca / datar; pembicara ditentukan dari gerak mulut saja", file=sys.stderr)
+
     cw = min(W, int(H * 9 / 16) // 2 * 2)
     dbg = [] if debug else None
     segs = plan_path(samples, shot_starts, dur, cw / W, cfg, dbg)
@@ -386,6 +472,7 @@ def process(video, start, dur, detector, cfg, det_width=1920, debug=False):
         "cuts": [round(c, 3) for c in shot_starts[1:]],
         "faces_seen": sum(1 for s in samples if s["faces"]),
         "samples": len(samples),
+        "audio": audio_ok,
         "segments": to_pixels(segs, W, cw),
     }
     if debug:
@@ -402,6 +489,7 @@ def main():
     ap.add_argument("--model", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task"))
     ap.add_argument("--max-faces", type=int, default=6)
     ap.add_argument("--det-width", type=int, default=1920, help="lebar maks frame untuk deteksi wajah (makin besar, bibir wajah kecil makin akurat)")
+    ap.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", "ffmpeg"), help="path ffmpeg (untuk membaca audio)")
     ap.add_argument("--debug", action="store_true", help="cetak timeline pembicara per shot dan simpan ke JSON")
     for k, v in DEFAULTS.items():
         ap.add_argument(f"--{k.replace('_', '-')}", type=float, default=v)
@@ -415,10 +503,10 @@ def main():
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         return 3
-    res = process(a.video, a.start, a.dur, det, cfg, a.det_width, a.debug)
+    res = process(a.video, a.start, a.dur, det, cfg, a.det_width, a.debug, a.ffmpeg)
     with open(a.out, "w", encoding="utf8") as f:
         json.dump(res, f)
-    print(f"  shot: {len(res['cuts']) + 1}, sampel dengan wajah: {res['faces_seen']}/{res['samples']}", file=sys.stderr)
+    print(f"  shot: {len(res['cuts']) + 1}, sampel dengan wajah: {res['faces_seen']}/{res['samples']}, audio: {'ya' if res['audio'] else 'tidak'}", file=sys.stderr)
     if a.debug:
         for sh in res["debug"]:
             print(f"  shot {sh['shot_from']}-{sh['shot_to']}s | wajah: " +

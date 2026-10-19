@@ -28,10 +28,14 @@ const { values: opt, positionals } = parseArgs({
     layout: { type: 'string', default: 'crop' },
     python: { type: 'string', default: process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3') },
     'track-model': { type: 'string', default: process.env.FACE_MODEL || '' }, // path face_landmarker.task (kosong = ./models di sebelah facetrack.py)
+    'min-score': { type: 'string', default: '0' }, // skor akhir minimal (0 = tanpa batas skor)
+    clips: { type: 'string', default: '0' }, // jumlah klip maksimal, diambil dari skor tertinggi (0 = semua yang lolos)
     nvenc: { type: 'boolean', default: false }, // encode pakai GPU NVIDIA
     'no-subs': { type: 'boolean', default: false },
     font: { type: 'string', default: 'Arial' }, // font subtitle (harus terinstall di Windows)
-    'sub-words': { type: 'string', default: '3' }, // maksimal kata per layar subtitle
+    'sub-words': { type: 'string', default: '6' }, // maksimal kata per layar subtitle
+    'sub-size': { type: 'string', default: '14' }, // ukuran font subtitle
+    'sub-margin': { type: 'string', default: '0' }, // jarak subtitle dari tepi bawah (0 = default: 90 vertikal / 22 horizontal); makin besar makin ke atas
     raw: { type: 'string', default: './video mentah' }, // video mentah + file kerja (audio, transkrip, srt)
     out: { type: 'string', default: './output' }, // klip hasil produksi
   },
@@ -49,8 +53,9 @@ if (!['crop', 'fit', 'follow'].includes(opt.layout)) {
 }
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
-// Dikunci: semua klip yang skor akhirnya >= MIN_SCORE diproduksi (tanpa batas jumlah), durasi 30-200 detik
-const MIN_SCORE = 8;
+// Skor minimal dan jumlah klip diatur lewat --min-score dan --clips (default: tanpa batas). Durasi dikunci 30-200 detik
+const MIN_SCORE = Number(opt['min-score']) || 0;
+const MAX_CLIPS = Math.floor(Number(opt.clips)) || 0;
 const MIN_DUR = 30;
 const MAX_DUR = 200;
 const NUM_CTX = Number(opt.ctx) || 16384;
@@ -60,9 +65,12 @@ const OVERLAP_SEC = Math.min(Math.max(120, MAX_DUR + 30), Math.floor(CHUNK_SEC /
 const SUB_WORDS = Math.max(1, Number(opt['sub-words']) || 3);
 
 // Ukuran subtitle mengikuti resolusi hasil: 1080x1920 (9:16) atau 1920x1080 (--horizontal)
+// Skala skrip ASS dibuat kecil (384 px sisi panjang) supaya font size 11 terlihat wajar, bukan raksasa/mikroskopis.
+// Hasil akhir tetap 1080x1920 / 1920x1080; libass otomatis memperbesar sesuai rasio.
+const SUB_SIZE = Number(opt['sub-size']) || 11;
 const SUB = opt.horizontal
-  ? { w: 1920, h: 1080, size: 58, outline: 4, marginV: 70, maxChars: 38 }
-  : { w: 1080, h: 1920, size: 80, outline: 6, marginV: 300, maxChars: 20 }; // marginV = jarak dari tepi bawah (px); makin kecil makin ke bawah
+  ? { w: 384, h: 216, size: SUB_SIZE, outline: 0.8, marginV: Number(opt['sub-margin']) || 22, marginH: 12, maxChars: 38 }
+  : { w: 216, h: 384, size: SUB_SIZE, outline: 0.8, marginV: Number(opt['sub-margin']) || 90, marginH: 12, maxChars: 20 }; // marginV = jarak dari tepi bawah; makin besar makin ke atas
 
 // ---------- Helper ----------
 function run(cmd, args, options = {}) {
@@ -331,7 +339,9 @@ async function pickClips(segs, workDir) {
   }
   pool.sort((a, b) => b.final - a.final);
 
-  const chosen = pool.filter((c) => c.final >= MIN_SCORE);
+  // pool sudah urut skor tertinggi; terapkan batas skor (jika ada) lalu ambil N teratas (jika --clips diisi)
+  let chosen = pool.filter((c) => c.final >= MIN_SCORE);
+  if (MAX_CLIPS > 0) chosen = chosen.slice(0, MAX_CLIPS);
   const ids = new Set(chosen);
   for (const c of pool) {
     console.log(`  ${ids.has(c) ? '✔' : '✘'} ${c.final.toFixed(1).padStart(4)}  ${clock(c.start)}-${clock(c.end)} (${Math.round(c.end - c.start)} dtk)  ${c.title}`);
@@ -423,20 +433,17 @@ async function buildAss(segs, clip, file) {
 
   const lines = [];
   const groups = groupWords(words, SUB_WORDS, SUB.maxChars);
+  // Satu baris subtitle per grup kata, tanpa sorotan warna
   groups.forEach((g, gi) => {
     const nextGroupStart = groups[gi + 1]?.[0].start ?? dur;
-    g.forEach((w, wi) => {
-      const next = g[wi + 1];
-      const rawEnd = next
-        ? next.start
-        : Math.min(Math.max(w.end, w.start + 0.15) + 0.25, nextGroupStart);
-      const end = Math.min(Math.max(rawEnd, w.start + 0.06), dur);
-      if (end <= w.start) return;
-      const text = g
-        .map((x, xi) => (xi === wi ? `{\\c&H00FFFF&}${x.text}{\\c&HFFFFFF&}` : x.text))
-        .join(' ');
-      lines.push(`Dialogue: 0,${fmtAss(w.start)},${fmtAss(end)},Default,,0,0,0,,${text}`);
-    });
+    const first = g[0];
+    const last = g.at(-1);
+    const start = first.start;
+    const rawEnd = Math.min(Math.max(last.end, last.start + 0.15) + 0.25, nextGroupStart);
+    const end = Math.min(Math.max(rawEnd, start + 0.1), dur);
+    if (end <= start) return;
+    const text = g.map((x) => x.text).join(' ');
+    lines.push(`Dialogue: 0,${fmtAss(start)},${fmtAss(end)},Default,,0,0,0,,${text}`);
   });
 
   const header = [
@@ -449,7 +456,7 @@ async function buildAss(segs, clip, file) {
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    `Style: Default,${opt.font},${SUB.size},${ASS_WHITE},${ASS_WHITE},${ASS_BLACK},${ASS_SHADOW},-1,0,0,0,100,100,0,0,1,${SUB.outline},2,2,60,60,${SUB.marginV},1`,
+    `Style: Default,${opt.font},${SUB.size},${ASS_WHITE},${ASS_WHITE},${ASS_BLACK},${ASS_SHADOW},-1,0,0,0,100,100,0,0,1,${SUB.outline},0.5,2,${SUB.marginH},${SUB.marginH},${SUB.marginV},1`,
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
