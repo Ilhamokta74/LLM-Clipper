@@ -365,7 +365,7 @@ async function buildSrt(segs, clip, file) {
     if (s.end <= clip.start || s.start >= clip.end) continue;
     const a = Math.max(s.start, clip.start) - clip.start;
     const b = Math.min(s.end, clip.end) - clip.start;
-    lines.push(`${n++}\n${fmtSrt(a)} --> ${fmtSrt(b)}\n${s.text}\n`);
+    lines.push(`${n++}\n${fmtSrt(a)} --> ${fmtSrt(b)}\n${s.text.replace(/(^|\s)[-–—]+\s+/g, '$1').replace(/^[-–—]+(?=\S)/, '')}\n`);
   }
   await fs.writeFile(file, lines.join('\n'), 'utf8');
 }
@@ -429,7 +429,8 @@ async function buildAss(segs, clip, file) {
     if (s.end <= clip.start || s.start >= clip.end) continue;
     for (const w of wordsOfSegment(s)) {
       if (w.start < clip.start - 0.05 || w.start >= clip.end) continue;
-      const raw = w.text.replace(/[{}\\]/g, '');
+      // Buang tanda "-" di awal kata (penanda dialog dari whisper, mis. "- Halo"); tanda hubung di tengah kata ("bolak-balik") tetap
+      const raw = w.text.replace(/[{}\\]/g, '').replace(/^[-–—]+\s*/, '');
       const text = raw.replace(/[.,;:…]+$/, ''); // tanda baca di akhir kata dibuang, ? dan ! tetap
       if (!text) continue;
       const prev = words.at(-1);
