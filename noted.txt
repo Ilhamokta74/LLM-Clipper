@@ -2,13 +2,15 @@ ollama --version
 ollama list
 ollama ps
 
-node clipper.mjs "https://www.youtube.com/watch?v=xSvjqPsG4Fo" --lang id --layout follow --nvenc
-node clipper.mjs "https://www.youtube.com/watch?v=9urnwyc6vHQ" --lang id --layout follow --nvenc
-node clipper.mjs "https://www.youtube.com/watch?v=ZoS_H4OKGTA" --lang id --layout follow --nvenc
-node clipper.mjs "https://www.youtube.com/watch?v=Sus8oNMgwUE" --lang id --layout follow --nvenc
-node clipper.mjs "https://www.youtube.com/watch?v=a1L80ccf3NY" --lang id --layout follow --nvenc
-node clipper.mjs "https://www.youtube.com/watch?v=TWMVLi_nKBM" --lang id --layout follow --nvenc
-node clipper.mjs "https://www.youtube.com/watch?v=8xDdDjRrAyo" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
+node clipper.mjs "" --lang id --layout follow --nvenc
 node clipper.mjs "" --lang id --layout follow --nvenc
 node clipper.mjs "" --lang id --layout follow --nvenc
 node clipper.mjs "" --lang id --layout follow --nvenc
