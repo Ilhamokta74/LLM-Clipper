@@ -98,6 +98,10 @@ const fmtSrt = (sec) => {
 const safeName = (s) =>
   s.replace(/[^\p{L}\p{N}\s-]/gu, '').trim().replace(/\s+/g, '_').slice(0, 60) || 'clip';
 
+// Nama file hasil (.mp4): murni judul klip, spasi dipertahankan (tanpa awalan clip_01_ dan tanpa underscore)
+const prettyName = (s) =>
+  s.replace(/[^\p{L}\p{N}\s-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 60).trim() || 'Klip';
+
 // Nama folder dari judul video: spasi dipertahankan, karakter terlarang Windows dibuang
 const folderName = (s) =>
   s
@@ -503,9 +507,16 @@ function followCropFilter(tr) {
 
 async function cutClips(workDir, outDir, videoName, segs, clips) {
   await fs.mkdir(outDir, { recursive: true });
+  const usedNames = new Set(); // cegah dua klip berjudul sama saling menimpa
   for (let i = 0; i < clips.length; i++) {
     const c = clips[i];
+    // base = nama file kerja (.srt/.ass/.track.json), tetap tanpa spasi supaya aman di filter ffmpeg
     const base = `clip_${String(i + 1).padStart(2, '0')}_${safeName(c.title)}`;
+    // outName = nama file hasil: judul saja, pakai spasi
+    const pretty = prettyName(c.title);
+    let outName = pretty;
+    for (let n = 2; usedNames.has(outName.toLowerCase()); n++) outName = `${pretty} ${n}`;
+    usedNames.add(outName.toLowerCase());
     const srtName = `${base}.srt`;
     await buildSrt(segs, c, path.join(workDir, srtName));
     const assName = `${base}.ass`;
@@ -540,7 +551,7 @@ async function cutClips(workDir, outDir, videoName, segs, clips) {
       filters.push(subFilter);
     }
 
-    const outFile = path.resolve(outDir, `${base}.mp4`);
+    const outFile = path.resolve(outDir, `${outName}.mp4`);
     const venc = opt.nvenc
       ? ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '21']
       : ['-c:v', 'libx264', '-preset', 'fast', '-crf', '20'];
