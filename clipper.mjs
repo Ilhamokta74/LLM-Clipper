@@ -33,8 +33,9 @@ const { values: opt, positionals } = parseArgs({
     nvenc: { type: 'boolean', default: false }, // encode pakai GPU NVIDIA
     'no-subs': { type: 'boolean', default: false },
     font: { type: 'string', default: 'Arial' }, // font subtitle (harus terinstall di Windows)
-    'sub-words': { type: 'string', default: '6' }, // maksimal kata per layar subtitle
-    'sub-size': { type: 'string', default: '14' }, // ukuran font subtitle
+    'sub-line': { type: 'string', default: '4' }, // maksimal kata per baris subtitle (layar = 2 baris)
+    'sub-size': { type: 'string', default: '13' }, // ukuran font subtitle
+    'sub-min': { type: 'string', default: '1' }, // durasi tampil minimal per layar subtitle (detik); makin besar makin lambat gantinya
     'sub-margin': { type: 'string', default: '0' }, // jarak subtitle dari tepi bawah (0 = default: 90 vertikal / 22 horizontal); makin besar makin ke atas
     raw: { type: 'string', default: './video mentah' }, // video mentah + file kerja (audio, transkrip, srt)
     out: { type: 'string', default: './output' }, // klip hasil produksi
@@ -62,15 +63,17 @@ const NUM_CTX = Number(opt.ctx) || 16384;
 const CHUNK_SEC = Number(opt.chunk);
 // Potongan transkrip saling menumpuk supaya klip panjang yang melewati batas potongan tetap utuh di salah satunya
 const OVERLAP_SEC = Math.min(Math.max(120, MAX_DUR + 30), Math.floor(CHUNK_SEC / 2));
-const SUB_WORDS = Math.max(1, Number(opt['sub-words']) || 3);
+const LINE_WORDS = Math.max(1, Math.floor(Number(opt['sub-line'])) || 5);
+const SUB_WORDS = LINE_WORDS * 2; // maksimal 2 baris per layar
+const SUB_MIN = Math.max(0.1, Number(opt['sub-min']) || 1.8);
 
 // Ukuran subtitle mengikuti resolusi hasil: 1080x1920 (9:16) atau 1920x1080 (--horizontal)
 // Skala skrip ASS dibuat kecil (384 px sisi panjang) supaya font size 11 terlihat wajar, bukan raksasa/mikroskopis.
 // Hasil akhir tetap 1080x1920 / 1920x1080; libass otomatis memperbesar sesuai rasio.
 const SUB_SIZE = Number(opt['sub-size']) || 11;
 const SUB = opt.horizontal
-  ? { w: 384, h: 216, size: SUB_SIZE, outline: 0.8, marginV: Number(opt['sub-margin']) || 22, marginH: 12, maxChars: 38 }
-  : { w: 216, h: 384, size: SUB_SIZE, outline: 0.8, marginV: Number(opt['sub-margin']) || 90, marginH: 12, maxChars: 20 }; // marginV = jarak dari tepi bawah; makin besar makin ke atas
+  ? { w: 384, h: 216, size: SUB_SIZE, outline: 0.8, marginV: Number(opt['sub-margin']) || 22, marginH: 12, maxChars: 999 }
+  : { w: 216, h: 384, size: SUB_SIZE, outline: 0.8, marginV: Number(opt['sub-margin']) || 90, marginH: 12, maxChars: 999 }; // marginV = jarak dari tepi bawah; makin besar makin ke atas
 
 // ---------- Helper ----------
 function run(cmd, args, options = {}) {
@@ -439,10 +442,16 @@ async function buildAss(segs, clip, file) {
     const first = g[0];
     const last = g.at(-1);
     const start = first.start;
-    const rawEnd = Math.min(Math.max(last.end, last.start + 0.15) + 0.25, nextGroupStart);
+    // Tampil minimal SUB_MIN detik (supaya sempat terbaca), tapi tidak boleh menimpa grup berikutnya
+    const wanted = Math.max(last.end + 0.3, start + SUB_MIN);
+    const rawEnd = Math.min(wanted, nextGroupStart);
     const end = Math.min(Math.max(rawEnd, start + 0.1), dur);
     if (end <= start) return;
-    const text = g.map((x) => x.text).join(' ');
+    // Maks 2 baris, tiap baris maks LINE_WORDS kata; kalau lebih dari satu baris, dibagi seimbang
+    const ws = g.map((x) => x.text);
+    const text = ws.length <= LINE_WORDS
+      ? ws.join(' ')
+      : ws.slice(0, Math.ceil(ws.length / 2)).join(' ') + '\\N' + ws.slice(Math.ceil(ws.length / 2)).join(' ');
     lines.push(`Dialogue: 0,${fmtAss(start)},${fmtAss(end)},Default,,0,0,0,,${text}`);
   });
 
