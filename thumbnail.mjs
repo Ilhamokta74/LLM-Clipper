@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Thumbnail potret (1080x1920) dari klip jadi hasil clipper.mjs
 // Alur: tiap file .mp4 di ./output/<folder>/ -> ambil beberapa frame -> pilih yang paling tajam -> blur area subtitle -> tempel teks hook
-// Nama klip (nama file) dipakai sebagai judul; thumbnail disimpan di folder yang sama dengan nama yang sama (.jpg).
+// Nama klip (nama file) dipakai sebagai judul; thumbnail disimpan di ./output-compressed/<folder>/ dengan nama yang sama (.jpg).
 // Butuh: Node 18+, ffmpeg, sharp (npm i sharp), Ollama (opsional, untuk teks hook; tanpa Ollama dipakai nama klip)
 //
 // Pemakaian: node thumbnail.mjs                 -> semua folder di ./output
 //            node thumbnail.mjs "<nama folder>"  -> satu folder saja
-// Opsi: [--no-llm] [--accent none] [--force] [--keep-subs] [--text-y 0.55] [--font Arial] [--text-size 120]
+// Opsi: [--dest ./output-compressed] [--no-llm] [--accent none] [--force] [--keep-subs] [--text-y 0.55] [--font Arial] [--text-size 120]
 
 import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
@@ -26,7 +26,8 @@ const { values: opt, positionals } = parseArgs({
     'no-llm': { type: 'boolean', default: false }, // pakai nama klip apa adanya sebagai teks
     'keep-subs': { type: 'boolean', default: false }, // jangan blur area subtitle (pakai kalau klip dibuat dengan --no-subs)
     force: { type: 'boolean', default: false }, // buat ulang thumbnail yang sudah ada (default: dilewati)
-    out: { type: 'string', default: './output' }, // harus sama dengan clipper.mjs
+    out: { type: 'string', default: './output' }, // harus sama dengan clipper.mjs (sumber klip)
+    dest: { type: 'string', default: './output-compressed' }, // folder tujuan thumbnail (struktur subfolder sama dengan sumber)
   },
 });
 
@@ -233,7 +234,9 @@ async function processFolder(dir, tmpRoot) {
   let made = 0;
   for (let i = 0; i < videos.length; i++) {
     const title = path.parse(videos[i]).name; // nama klip = judul
-    const outFile = path.join(dir, `${title}.jpg`);
+    const outDir = path.resolve(opt.dest, path.basename(dir));
+    await fs.mkdir(outDir, { recursive: true });
+    const outFile = path.join(outDir, `${title}.jpg`);
     if (!opt.force && (await fs.stat(outFile).catch(() => null))) {
       console.log(`• ${i + 1}/${videos.length}: ${title} (sudah ada, dilewati; pakai --force untuk buat ulang)`);
       continue;
