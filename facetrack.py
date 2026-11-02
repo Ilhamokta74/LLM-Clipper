@@ -5,7 +5,7 @@ facetrack.py - jalur crop 9:16 yang mengikuti pembicara (untuk clipper.mjs --lay
 Cara kerja:
   1. Baca video dari detik --start selama --dur (waktu dibaca dari timestamp frame, bukan hitung manual),
      deteksi pergantian kamera (cut) di setiap frame.
-  2. Deteksi wajah + gerak rahang/bibir (MediaPipe FaceLandmarker, blendshape jawOpen) ~12x per detik.
+  2. Deteksi wajah + gerak rahang/bibir (MediaPipe FaceLandmarker, blendshape jawOpen) ~14x per detik.
   3. Per shot (satu kamera): lacak tiap wajah, hitung "keaktifan bicara" tiap wajah per waktu
      (jendela terpusat, bisa lihat ke depan karena ini offline), lalu pilih pembicara untuk SELURUH shot
      sekaligus dengan Viterbi (ada biaya pindah, jadi tidak lompat-lompat), kamera mulai bergeser sedikit
@@ -34,24 +34,24 @@ MODEL_URL = (
 
 # Nilai awal; perlu disetel kalau hasil di video nyata kurang pas (lihat --help)
 DEFAULTS = dict(
-    sample_fps=12.0,      # frekuensi deteksi wajah (bibir bicara ~4-5 Hz, 8 fps terlalu jarang)
+    sample_fps=14.0,      # lebih sering → lebih akurat
     cut_mad=22.0,         # ambang selisih rata-rata piksel antar frame untuk dianggap cut
     track_dist=0.07,      # jarak maks (fraksi lebar frame) wajah dianggap orang yang sama dalam satu shot
-    speak_win=0.7,        # detik: jendela (terpusat) untuk mengukur gerak mulut
-    speak_floor=0.03,     # batas bawah skala gerak mulut (di bawah ini dianggap noise/diam)
-    speak_thr=0.3,        # skor relatif minimal (0-1 dari skala bicara di shot itu) untuk dihitung bicara
-    switch_cost=3.0,      # biaya pindah pembicara; makin besar makin "keras kepala" (tidak mudah pindah)
-    lead=0.15,            # detik: kamera mulai pindah segini lebih awal dari keputusan pembicara
-    dead_zone=0.04,       # geser kamera (tanpa ganti pembicara) hanya kalau target bergeser > ini (fraksi lebar frame)
-    move_dur=0.3,         # detik durasi geser saat ganti pembicara
-    drift_dur=0.5,        # detik durasi geser halus saat orangnya sendiri bergerak
-    present_win=1.5,      # detik: wajah dianggap masih ada setelah terakhir terlihat
+    speak_win=0.65,       # detik: jendela (terpusat) untuk mengukur gerak mulut
+    speak_floor=0.025,    # batas bawah skala gerak mulut (di bawah ini dianggap noise/diam)
+    speak_thr=0.22,       # skor relatif minimal (0-1 dari skala bicara di shot itu) untuk dihitung bicara
+    switch_cost=5.0,      # biaya pindah pembicara; makin besar makin "keras kepala" (tidak mudah pindah)
+    lead=0.22,            # detik: kamera mulai pindah segini lebih awal dari keputusan pembicara
+    dead_zone=0.025,      # geser kamera (tanpa ganti pembicara) hanya kalau target bergeser > ini (fraksi lebar frame)
+    move_dur=0.22,        # detik durasi geser saat ganti pembicara
+    drift_dur=0.35,       # detik durasi geser halus saat orangnya sendiri bergerak
+    present_win=1.6,      # detik: wajah dianggap masih ada setelah terakhir terlihat
     min_track_frac=0.15,  # track yang terlihat < segini dari sampel shot dianggap wajah palsu (poster dsb)
     use_audio=1.0,        # 1 = pakai audio (gerbang suara + sinkron bibir-audio), 0 = visual saja
-    audio_gate=0.25,      # bobot gerak mulut saat audio diam (0 = abaikan total, 1 = audio tidak berpengaruh)
-    corr_w=1.0,           # kekuatan bonus/penalti korelasi bukaan mulut vs keras suara (0 = matikan)
-    corr_win=1.5,         # detik: jendela (terpusat) untuk menghitung korelasi
-    audio_cap=0.6,        # saat audio ada: batas atas skor gerak mulut (gerak besar tapi tidak sinkron tidak boleh menang)
+    audio_gate=0.12,      # bobot gerak mulut saat audio diam (0 = abaikan total, 1 = audio tidak berpengaruh)
+    corr_w=1.4,           # kekuatan bonus/penalti korelasi bukaan mulut vs keras suara (0 = matikan)
+    corr_win=1.4,         # detik: jendela (terpusat) untuk menghitung korelasi
+    audio_cap=0.55,       # saat audio ada: batas atas skor gerak mulut (gerak besar tapi tidak sinkron tidak boleh menang)
 )
 
 
