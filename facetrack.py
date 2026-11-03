@@ -5,7 +5,7 @@ facetrack.py - jalur crop 9:16 yang mengikuti pembicara (untuk clipper.mjs --lay
 Cara kerja:
   1. Baca video dari detik --start selama --dur (waktu dibaca dari timestamp frame, bukan hitung manual),
      deteksi pergantian kamera (cut) di setiap frame.
-  2. Deteksi wajah + gerak rahang/bibir (MediaPipe FaceLandmarker, blendshape jawOpen) ~14x per detik.
+  2. Deteksi wajah (BlazeFace full-range + FaceLandmarker ROI untuk jawOpen) ~10x per detik.
   3. Per shot (satu kamera): lacak tiap wajah, hitung "keaktifan bicara" tiap wajah per waktu
      (jendela terpusat, bisa lihat ke depan karena ini offline), lalu pilih pembicara untuk SELURUH shot
      sekaligus dengan Viterbi (ada biaya pindah, jadi tidak lompat-lompat), kamera mulai bergeser sedikit
@@ -14,7 +14,7 @@ Cara kerja:
 
 Pemakaian:
   python facetrack.py video.mp4 --start 125.3 --dur 48 --out track.json
-  python facetrack.py video.mp4 --start 125.3 --dur 48 --out track.json --debug   # + file .debug.json & timeline pembicara
+  python facetrack.py video.mp4 --start 125.3 --dur 48 --out track.json --debug   # + timeline pembicara
 """
 import argparse
 import json
@@ -31,11 +31,15 @@ MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
+FACE_DET_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_detector/"
+    "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+)
 
 # Nilai awal; perlu disetel kalau hasil di video nyata kurang pas (lihat --help)
 DEFAULTS = dict(
-    sample_fps=14.0,      # lebih sering → lebih akurat
-    cut_mad=22.0,         # ambang selisih rata-rata piksel antar frame untuk dianggap cut
+    sample_fps=10.0,      # lebih sering → lebih akurat (turunkan jika lambat karena ROI landmarker)
+    cut_mad=28.0,         # ambang selisih rata-rata piksel antar frame untuk dianggap cut
     track_dist=0.07,      # jarak maks (fraksi lebar frame) wajah dianggap orang yang sama dalam satu shot
     speak_win=0.65,       # detik: jendela (terpusat) untuk mengukur gerak mulut
     speak_floor=0.025,    # batas bawah skala gerak mulut (di bawah ini dianggap noise/diam)
@@ -74,7 +78,11 @@ def ensure_model(path):
 
 
 class FaceDetector:
-    """MediaPipe FaceLandmarker (Tasks API). Mengembalikan cx (0-1), w (0-1), m (gerak mulut ~0-1)."""
+    """Robust face detector: BlazeFace full-range untuk lokasi + FaceLandmarker di ROI untuk jawOpen.
+
+    Returns list of dicts: cx (0-1), w (0-1), m (jawOpen ~0-1).
+    Deteksi yang landmarker-nya gagal dibuang (biasanya poster / false positive).
+    """
 
     def __init__(self, model_path, max_faces=6):
         import mediapipe as mp
@@ -82,46 +90,115 @@ class FaceDetector:
         from mediapipe.tasks.python import vision
 
         self.mp = mp
-        options = vision.FaceLandmarkerOptions(
+        self.max_faces = max_faces
+
+        # Full-range BlazeFace jauh lebih andal di wide shot / pose bervariasi
+        det_path = os.path.join(os.path.dirname(os.path.abspath(model_path)), "blaze_face_short_range.tflite")
+        if not os.path.exists(det_path):
+            print(f"• Mengunduh model deteksi wajah ke {det_path} ...", file=sys.stderr)
+            try:
+                urllib.request.urlretrieve(FACE_DET_URL, det_path)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"Gagal unduh face detector: {e}") from e
+        det_opts = vision.FaceDetectorOptions(
+            base_options=mp_python.BaseOptions(
+                model_asset_path=det_path,
+                delegate=mp_python.BaseOptions.Delegate.CPU,
+            ),
+            running_mode=vision.RunningMode.IMAGE,
+            min_detection_confidence=0.45,
+        )
+        self.detector = vision.FaceDetector.create_from_options(det_opts)
+
+        # Landmarker hanya untuk blendshapes (jawOpen) pada ROI yang sudah di-crop
+        lm_opts = vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=ensure_model(model_path)),
             running_mode=vision.RunningMode.IMAGE,
-            num_faces=max_faces,
-            min_face_detection_confidence=0.4,
-            min_face_presence_confidence=0.4,
-            min_tracking_confidence=0.4,
-            output_face_blendshapes=True,  # jawOpen jauh lebih stabil daripada jarak bibir mentah (tahan miring kepala)
+            num_faces=1,
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
+            output_face_blendshapes=True,
         )
-        self.landmarker = vision.FaceLandmarker.create_from_options(options)
+        self.landmarker = vision.FaceLandmarker.create_from_options(lm_opts)
+
+    def _jaw_from_landmarks(self, result):
+        if not result.face_landmarks:
+            return None
+        blends = getattr(result, "face_blendshapes", None) or []
+        if blends:
+            for c in blends[0]:
+                if c.category_name == "jawOpen":
+                    return float(c.score)
+        # fallback: jarak bibir
+        pts = result.face_landmarks[0]
+        ys = [p.y for p in pts]
+        face_h = max(ys) - min(ys)
+        if face_h <= 0:
+            return 0.0
+        return 5.0 * abs(pts[14].y - pts[13].y) / face_h
 
     def detect(self, bgr):
+        h, w = bgr.shape[:2]
         rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
-        result = self.landmarker.detect(image)
-        blends = getattr(result, "face_blendshapes", None) or []
+        det = self.detector.detect(image)
+
         faces = []
-        for i, pts in enumerate(result.face_landmarks):
-            xs = [p.x for p in pts]
-            ys = [p.y for p in pts]
-            face_h = max(ys) - min(ys)
-            if face_h <= 0:
+        # urutkan skor tertinggi dulu
+        dets = sorted(
+            det.detections or [],
+            key=lambda d: d.categories[0].score if d.categories else 0,
+            reverse=True,
+        )
+        for d in dets[: self.max_faces]:
+            bb = d.bounding_box
+            cx = (bb.origin_x + bb.width / 2) / w
+            fw = bb.width / w
+            if fw < 0.02 or fw > 0.6:  # skip terlalu kecil / besar (poster, false)
                 continue
-            jaw = None
-            if i < len(blends):
-                for c in blends[i]:
-                    if c.category_name == "jawOpen":
-                        jaw = float(c.score)
-                        break
-            if jaw is None:  # cadangan: jarak bibir dalam atas (13) & bawah (14), diskalakan mendekati jawOpen
-                jaw = 5.0 * abs(pts[14].y - pts[13].y) / face_h
-            faces.append({"cx": (min(xs) + max(xs)) / 2, "w": max(xs) - min(xs), "m": jaw})
+
+            # crop ROI dengan margin untuk landmarker
+            pad = 0.35
+            x0 = max(0, int(bb.origin_x - pad * bb.width))
+            y0 = max(0, int(bb.origin_y - pad * bb.height))
+            x1 = min(w, int(bb.origin_x + (1 + pad) * bb.width))
+            y1 = min(h, int(bb.origin_y + (1 + pad) * bb.height))
+            if x1 - x0 < 24 or y1 - y0 < 24:
+                continue
+
+            roi = bgr[y0:y1, x0:x1]
+            roi_rgb = np.ascontiguousarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+            roi_img = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=roi_rgb)
+            try:
+                lm = self.landmarker.detect(roi_img)
+                jaw = self._jaw_from_landmarks(lm)
+                if jaw is None or not lm.face_landmarks:
+                    # landmarker gagal → kemungkinan poster / false positive, buang
+                    continue
+                # refine posisi dari landmarks (lebih akurat)
+                pts = lm.face_landmarks[0]
+                xs = [p.x for p in pts]
+                roi_w = x1 - x0
+                cx = (x0 + (min(xs) + max(xs)) / 2 * roi_w) / w
+                fw = (max(xs) - min(xs)) * roi_w / w
+            except Exception:  # noqa: BLE001
+                continue
+            faces.append({"cx": float(cx), "w": float(fw), "m": float(jaw)})
         return faces
 
 
 # ---------------------------------------------------------------- audio
 def load_audio_db(video, start, dur, ffmpeg="ffmpeg", sr=16000):
     """Keras suara (dB) tiap 10 ms, dibatasi ke pita suara manusia. None kalau ffmpeg gagal / tidak ada audio."""
-    cmd = [ffmpeg, "-v", "error", "-ss", f"{max(start, 0.0):.3f}", "-t", f"{dur:.3f}", "-i", video,
-           "-vn", "-ac", "1", "-ar", str(sr), "-af", "highpass=f=150,lowpass=f=3800", "-f", "f32le", "-"]
+    cmd = [
+        ffmpeg, "-v", "error",
+        "-ss", f"{max(start, 0.0):.3f}", "-t", f"{dur:.3f}",
+        "-i", video,
+        "-vn", "-ac", "1", "-ar", str(sr),
+        "-af", "highpass=f=150,lowpass=f=3800",
+        "-f", "f32le", "-",
+    ]
     try:
         raw = subprocess.run(cmd, capture_output=True, timeout=600).stdout
     except Exception:  # noqa: BLE001
@@ -442,7 +519,8 @@ def process(video, start, dur, detector, cfg, det_width=1920, debug=False, ffmpe
         if prev is not None:
             mad = float(np.mean(np.abs(small - prev)))
             base = np.mean(mads[-10:]) if mads else 0.0
-            if mad > cfg["cut_mad"] and mad > 3 * base:
+            # min 0.35s antar cut supaya micro-cut dari gerak besar / orang jatuh tidak memecah shot
+            if mad > cfg["cut_mad"] and mad > 3 * base and (t - shot_starts[-1]) >= 0.35:
                 is_cut = True
                 shot_starts.append(t)
                 mads.clear()
@@ -451,10 +529,17 @@ def process(video, start, dur, detector, cfg, det_width=1920, debug=False, ffmpe
         prev = small
 
         if t + 1e-6 >= next_sample or is_cut:
+            # deteksi di resolusi penuh (BlazeFace full-range + ROI kecil untuk landmarker)
+            # det_width hanya dipakai jika video sangat besar (>4K) agar tidak terlalu lambat
             f = frame
-            if W > det_width:
+            if W > max(det_width, 2560):
                 f = cv2.resize(frame, (det_width, int(H * det_width / W)))
-            samples.append({"t": t, "shot": len(shot_starts) - 1, "faces": detector.detect(f)})
+            try:
+                faces = detector.detect(f)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! deteksi gagal di t={t:.2f}s: {e}", file=sys.stderr)
+                faces = []
+            samples.append({"t": t, "shot": len(shot_starts) - 1, "faces": faces})
             next_sample = t + 1.0 / cfg["sample_fps"]
     cap.release()
 
@@ -488,7 +573,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task"))
     ap.add_argument("--max-faces", type=int, default=6)
-    ap.add_argument("--det-width", type=int, default=1920, help="lebar maks frame untuk deteksi wajah (makin besar, bibir wajah kecil makin akurat)")
+    ap.add_argument("--det-width", type=int, default=1920, help="lebar maks frame untuk deteksi wajah (hanya dipakai jika video >4K)")
     ap.add_argument("--ffmpeg", default=os.environ.get("FFMPEG", "ffmpeg"), help="path ffmpeg (untuk membaca audio)")
     ap.add_argument("--debug", action="store_true", help="cetak timeline pembicara per shot dan simpan ke JSON")
     for k, v in DEFAULTS.items():
@@ -506,11 +591,18 @@ def main():
     res = process(a.video, a.start, a.dur, det, cfg, a.det_width, a.debug, a.ffmpeg)
     with open(a.out, "w", encoding="utf8") as f:
         json.dump(res, f)
-    print(f"  shot: {len(res['cuts']) + 1}, sampel dengan wajah: {res['faces_seen']}/{res['samples']}, audio: {'ya' if res['audio'] else 'tidak'}", file=sys.stderr)
+    print(
+        f"  shot: {len(res['cuts']) + 1}, sampel dengan wajah: {res['faces_seen']}/{res['samples']}, "
+        f"audio: {'ya' if res['audio'] else 'tidak'}",
+        file=sys.stderr,
+    )
     if a.debug:
         for sh in res["debug"]:
-            print(f"  shot {sh['shot_from']}-{sh['shot_to']}s | wajah: " +
-                  ", ".join(f"#{i}(x={t['x']},n={t['n']})" for i, t in enumerate(sh["tracks"])), file=sys.stderr)
+            print(
+                f"  shot {sh['shot_from']}-{sh['shot_to']}s | wajah: "
+                + ", ".join(f"#{i}(x={t['x']},n={t['n']})" for i, t in enumerate(sh["tracks"])),
+                file=sys.stderr,
+            )
             for r in sh["speaker_runs"]:
                 print(f"     {r['from']:>6}-{r['to']:<6} -> wajah #{r['track']}", file=sys.stderr)
     return 0

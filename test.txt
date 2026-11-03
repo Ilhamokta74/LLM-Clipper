@@ -1,19 +1,19 @@
-node clipper.mjs "https://www.youtube.com/watch?v=K0H5wYDJJjo" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=R-aeHIrS_50" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=HUjvA9sCg28" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=UXHNgJO9Tuc" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=IqgIGpniVl8" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=JlZqXwryUOw" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=phfekAecJi4" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=Fn-a73_C6Vk" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=NXGqKIIXUgQ" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=5EerwahPwN4" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=kqX7P_bd41k" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=NJ04KISduB8" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=IxMvLj8x18Q" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=2u2iaA-T5d0" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=Cmq3dp0R7FA" --lang id --layout follow --nvenc 
-node clipper.mjs "https://www.youtube.com/watch?v=Vto2kgrhVHM" --lang id --layout follow --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=K0H5wYDJJjo" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=R-aeHIrS_50" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=HUjvA9sCg28" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=UXHNgJO9Tuc" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=IqgIGpniVl8" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=JlZqXwryUOw" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=phfekAecJi4" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=Fn-a73_C6Vk" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=NXGqKIIXUgQ" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=5EerwahPwN4" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=kqX7P_bd41k" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=NJ04KISduB8" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=IxMvLj8x18Q" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=2u2iaA-T5d0" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=Cmq3dp0R7FA" --nvenc 
+node horizontal.mjs "https://www.youtube.com/watch?v=Vto2kgrhVHM" --nvenc 
 
 
 

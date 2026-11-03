@@ -4,6 +4,8 @@ ollama ps
 
 node compress.js --nvenc
 
+python facetrack.py --batch
+
 node clipper.mjs "" --lang id --layout follow --nvenc
 node clipper.mjs "" --lang id --layout follow --nvenc
 node clipper.mjs "" --lang id --layout follow --nvenc
